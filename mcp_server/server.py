@@ -6,15 +6,27 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import logging
+from logging.handlers import RotatingFileHandler
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+_LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+_PROJECT_ROOT = Path(__file__).parent.parent
+_LOG_FILE = _PROJECT_ROOT / "code_search.log"
+
+_file_handler = RotatingFileHandler(
+    _LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
 )
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+
+_stream_handler = logging.StreamHandler()
+_stream_handler.setLevel(logging.DEBUG)
+_stream_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+
+logging.basicConfig(level=logging.DEBUG, handlers=[_stream_handler, _file_handler])
 logger = logging.getLogger(__name__)
 logging.getLogger("mcp").setLevel(logging.DEBUG)
 logging.getLogger("fastmcp").setLevel(logging.DEBUG)
+logger.info(f"File logging enabled at {_LOG_FILE}")
 
 from mcp_server.code_search_server import CodeSearchServer
 from mcp_server.code_search_mcp import CodeSearchMCP

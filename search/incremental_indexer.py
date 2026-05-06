@@ -1,6 +1,7 @@
 """Incremental indexing using Merkle tree change detection."""
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,34 @@ from embeddings.embedder import CodeEmbedder
 from search.indexer import CodeIndexManager as Indexer
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"Invalid int for {name}={raw!r}; using default {default}")
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(f"Invalid float for {name}={raw!r}; using default {default}")
+        return default
+
+
+# Default flush thresholds; env vars override at instantiation time.
+DEFAULT_FLUSH_FILES = 200
+DEFAULT_FLUSH_BYTES = 256 * 1024 * 1024  # 256 MB of chunked content
+DEFAULT_FLUSH_SECONDS = 60.0
 
 
 @dataclass
@@ -51,21 +80,51 @@ class IncrementalIndexer:
         indexer: Optional[Indexer] = None,
         embedder: Optional[CodeEmbedder] = None,
         chunker: Optional[MultiLanguageChunker] = None,
-        snapshot_manager: Optional[SnapshotManager] = None
+        snapshot_manager: Optional[SnapshotManager] = None,
+        flush_every_files: Optional[int] = None,
+        flush_every_bytes: Optional[int] = None,
+        flush_every_seconds: Optional[float] = None,
     ):
         """Initialize incremental indexer.
-        
+
         Args:
             indexer: Indexer instance
             embedder: Embedder instance
             chunker: Code chunker instance
             snapshot_manager: Snapshot manager instance
+            flush_every_files: Flush index after this many files (env: CODE_SEARCH_FLUSH_FILES)
+            flush_every_bytes: Flush index after this many bytes of chunked content
+                (env: CODE_SEARCH_FLUSH_BYTES)
+            flush_every_seconds: Flush index after this many seconds since the last flush
+                (env: CODE_SEARCH_FLUSH_SECONDS)
         """
         self.indexer = indexer or Indexer()
         self.embedder = embedder or CodeEmbedder()
         self.chunker = chunker or MultiLanguageChunker()
         self.snapshot_manager = snapshot_manager or SnapshotManager()
         self.change_detector = ChangeDetector(self.snapshot_manager)
+
+        self.flush_every_files = (
+            flush_every_files
+            if flush_every_files is not None
+            else _env_int("CODE_SEARCH_FLUSH_FILES", DEFAULT_FLUSH_FILES)
+        )
+        self.flush_every_bytes = (
+            flush_every_bytes
+            if flush_every_bytes is not None
+            else _env_int("CODE_SEARCH_FLUSH_BYTES", DEFAULT_FLUSH_BYTES)
+        )
+        self.flush_every_seconds = (
+            flush_every_seconds
+            if flush_every_seconds is not None
+            else _env_float("CODE_SEARCH_FLUSH_SECONDS", DEFAULT_FLUSH_SECONDS)
+        )
+        logger.info(
+            "Indexer flush thresholds: "
+            f"files={self.flush_every_files}, "
+            f"bytes={self.flush_every_bytes}, "
+            f"seconds={self.flush_every_seconds}"
+        )
     
     def detect_changes(self, project_path: str) -> Tuple[FileChanges, MerkleDAG]:
         """Detect changes in project since last snapshot.
@@ -186,45 +245,20 @@ class IncrementalIndexer:
         try:
             # Clear existing index
             self.indexer.clear_index()
-            
+
             # Build DAG for all files
             dag = MerkleDAG(project_path)
             dag.build()
             all_files = dag.get_all_files()
-            
+
             # Filter supported files
             supported_files = [f for f in all_files if self.chunker.is_supported(f)]
-            
-            # Collect all chunks first, then embed in a single pass for efficiency
-            all_chunks = []
-            for file_path in supported_files:
-                full_path = Path(project_path) / file_path
-                try:
-                    chunks = self.chunker.chunk_file(str(full_path))
-                    if chunks:
-                        all_chunks.extend(chunks)
-                except Exception as e:
-                    logger.warning(f"Failed to chunk {file_path}: {e}")
 
-            # Embed all chunks in one batched call
-            all_embedding_results = []
-            if all_chunks:
-                try:
-                    all_embedding_results = self.embedder.embed_chunks(all_chunks)
-                    # Update metadata
-                    for chunk, embedding_result in zip(all_chunks, all_embedding_results):
-                        embedding_result.metadata['project_name'] = project_name
-                        embedding_result.metadata['content'] = chunk.content
-                except Exception as e:
-                    logger.warning(f"Embedding failed: {e}")
-            
-            # Add all embeddings to index at once
-            if all_embedding_results:
-                self.indexer.add_embeddings(all_embedding_results)
-            
-            chunks_added = len(all_embedding_results)
-            
-            # Save snapshot
+            chunks_added = self._chunk_embed_persist_batched(
+                supported_files, project_path, project_name
+            )
+
+            # Save snapshot only after all batches succeeded
             self.snapshot_manager.save_snapshot(dag, {
                 'project_name': project_name,
                 'full_index': True,
@@ -232,8 +266,8 @@ class IncrementalIndexer:
                 'supported_files': len(supported_files),
                 'chunks_indexed': chunks_added
             })
-            
-            # Save index
+
+            # Final save (most recent batch was already flushed, but this is cheap)
             self.indexer.save_index()
             
             return IncrementalIndexResult(
@@ -297,37 +331,119 @@ class IncrementalIndexer:
             Number of chunks added
         """
         files_to_index = self.change_detector.get_files_to_reindex(changes)
-        
+
         # Filter supported files
         supported_files = [f for f in files_to_index if self.chunker.is_supported(f)]
-        
-        # Collect all chunks first, then embed in a single pass
-        chunks_to_embed = []
-        for file_path in supported_files:
-            full_path = Path(project_path) / file_path
-            try:
-                chunks = self.chunker.chunk_file(str(full_path))
-                if chunks:
-                    chunks_to_embed.extend(chunks)
-            except Exception as e:
-                logger.warning(f"Failed to chunk {file_path}: {e}")
 
-        all_embedding_results = []
-        if chunks_to_embed:
+        return self._chunk_embed_persist_batched(
+            supported_files, project_path, project_name
+        )
+
+    def _chunk_embed_persist_batched(
+        self,
+        supported_files: List[str],
+        project_path: str,
+        project_name: str,
+    ) -> int:
+        """Chunk, embed, and persist files in batches with periodic flushing.
+
+        Buffers chunks in memory until any of the configured thresholds
+        (file count, byte count, elapsed time) is exceeded, then embeds and
+        writes the index to disk. On exception, flushes whatever is buffered
+        before re-raising so partial progress isn't lost.
+
+        Returns:
+            Total number of chunks embedded and added to the index.
+        """
+        chunks_buffer: list = []
+        bytes_buffer = 0
+        files_in_batch = 0
+        total_chunks = 0
+        files_processed = 0
+        last_flush_time = time.time()
+        start = time.time()
+
+        def flush(reason: str) -> int:
+            nonlocal chunks_buffer, bytes_buffer, files_in_batch, last_flush_time
+            if not chunks_buffer:
+                return 0
+            buf = chunks_buffer
+            batch_files = files_in_batch
+            batch_bytes = bytes_buffer
+            chunks_buffer = []
+            bytes_buffer = 0
+            files_in_batch = 0
+            flushed = self._embed_and_persist_batch(buf, project_name)
+            elapsed = time.time() - last_flush_time
+            last_flush_time = time.time()
+            logger.info(
+                f"Flushed batch ({reason}): {flushed} chunks from "
+                f"{batch_files} files / {batch_bytes / 1024 / 1024:.1f} MB "
+                f"in {elapsed:.1f}s"
+            )
+            return flushed
+
+        try:
+            for file_path in supported_files:
+                full_path = Path(project_path) / file_path
+                try:
+                    chunks = self.chunker.chunk_file(str(full_path))
+                except Exception as e:
+                    logger.warning(f"Failed to chunk {file_path}: {e}")
+                    chunks = []
+
+                files_processed += 1
+                files_in_batch += 1
+                if chunks:
+                    chunks_buffer.extend(chunks)
+                    bytes_buffer += sum(
+                        len(c.content.encode("utf-8", errors="ignore")) for c in chunks
+                    )
+
+                if files_in_batch >= self.flush_every_files:
+                    total_chunks += flush("file count")
+                elif bytes_buffer >= self.flush_every_bytes:
+                    total_chunks += flush("byte count")
+                elif (time.time() - last_flush_time) >= self.flush_every_seconds:
+                    total_chunks += flush("elapsed time")
+
+            total_chunks += flush("final")
+            logger.info(
+                f"Indexing complete: {total_chunks} chunks from "
+                f"{files_processed} files in {time.time() - start:.1f}s"
+            )
+            return total_chunks
+        except Exception:
             try:
-                all_embedding_results = self.embedder.embed_chunks(chunks_to_embed)
-                # Update metadata
-                for chunk, embedding_result in zip(chunks_to_embed, all_embedding_results):
-                    embedding_result.metadata['project_name'] = project_name
-                    embedding_result.metadata['content'] = chunk.content
+                total_chunks += flush("error recovery")
+                logger.error(
+                    f"Indexing aborted after {files_processed} files; "
+                    f"flushed {total_chunks} chunks before failure"
+                )
+            except Exception as inner:
+                logger.error(f"Failed to flush during error recovery: {inner}")
+            raise
+
+    def _embed_and_persist_batch(self, chunks: list, project_name: str) -> int:
+        """Embed a buffered batch of chunks, add to index, and persist to disk."""
+        if not chunks:
+            return 0
+        try:
+            embedding_results = self.embedder.embed_chunks(chunks)
+        except Exception as e:
+            logger.warning(f"Embedding failed for batch of {len(chunks)} chunks: {e}")
+            return 0
+        for chunk, result in zip(chunks, embedding_results):
+            result.metadata['project_name'] = project_name
+            result.metadata['content'] = chunk.content
+        if embedding_results:
+            self.indexer.add_embeddings(embedding_results)
+            try:
+                self.indexer.save_index()
             except Exception as e:
-                logger.warning(f"Embedding failed: {e}")
-        
-        # Add all embeddings to index at once
-        if all_embedding_results:
-            self.indexer.add_embeddings(all_embedding_results)
-        
-        return len(all_embedding_results)
+                logger.error(f"Failed to persist index after batch: {e}")
+                raise
+        return len(embedding_results)
     
     
     def get_indexing_stats(self, project_path: str) -> Optional[Dict]:

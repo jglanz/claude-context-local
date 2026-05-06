@@ -52,19 +52,40 @@ class SentenceTransformerModel(EmbeddingModel):
         except Exception as e:
             self._logger.debug(f"Offline mode detection skipped: {e}")
 
-        try:
-            model_source = str(local_model_dir) if local_model_dir else self.model_name
-            model = SentenceTransformer(
+        model_source = str(local_model_dir) if local_model_dir else self.model_name
+
+        def _load(device: str) -> SentenceTransformer:
+            return SentenceTransformer(
                 model_source,
                 cache_folder=self.cache_dir,
-                device=self._device
+                device=device
             )
-            self._logger.info(f"Model loaded successfully on device: {model.device}")
-            self._model_loaded = True
-            return model
+
+        try:
+            model = _load(self._device)
         except Exception as e:
-            self._logger.error(f"Failed to load model: {e}")
-            raise
+            if self._device != "cpu" and self._is_gpu_error(e):
+                self._logger.warning(
+                    f"Failed to load model on {self._device} ({e}); falling back to CPU."
+                )
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                self._device = "cpu"
+                try:
+                    model = _load("cpu")
+                except Exception as cpu_e:
+                    self._logger.error(f"Failed to load model on CPU after GPU fallback: {cpu_e}")
+                    raise
+            else:
+                self._logger.error(f"Failed to load model: {e}")
+                raise
+
+        self._logger.info(f"Model loaded successfully on device: {model.device}")
+        self._model_loaded = True
+        return model
 
     def encode(self, texts: list[str], **kwargs) -> np.ndarray:
         """Encode texts using SentenceTransformer.
@@ -76,7 +97,34 @@ class SentenceTransformerModel(EmbeddingModel):
         Returns:
             Array of embeddings
         """
-        return self.model.encode(texts, **kwargs)
+        try:
+            return self.model.encode(texts, **kwargs)
+        except Exception as e:
+            if str(self.model.device) != "cpu" and self._is_gpu_error(e):
+                self._logger.warning(
+                    f"Encode failed on {self.model.device} ({e}); moving model to CPU and retrying."
+                )
+                try:
+                    self.model.to("cpu")
+                    self._device = "cpu"
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception as move_e:
+                    self._logger.error(f"Failed to move model to CPU: {move_e}")
+                    raise
+                return self.model.encode(texts, **kwargs)
+            raise
+
+    @staticmethod
+    def _is_gpu_error(exc: BaseException) -> bool:
+        """Detect GPU/accelerator errors (OOM, CUDA init failures, etc.)."""
+        if isinstance(exc, (torch.cuda.OutOfMemoryError,)):
+            return True
+        accel_err = getattr(torch, "AcceleratorError", None)
+        if accel_err is not None and isinstance(exc, accel_err):
+            return True
+        msg = str(exc).lower()
+        return any(s in msg for s in ("cuda", "out of memory", "cublas", "cudnn", "device-side", "nvml"))
 
     def get_embedding_dimension(self) -> int:
         """Get embedding dimension."""
