@@ -1,4 +1,5 @@
 """FastMCP server for Claude Code integration - main entry point."""
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +11,9 @@ from logging.handlers import RotatingFileHandler
 
 _LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 _PROJECT_ROOT = Path(__file__).parent.parent
-_LOG_FILE = _PROJECT_ROOT / "code_search.log"
+_LOGS_DIR = _PROJECT_ROOT / "logs"
+_LOG_FILE = _LOGS_DIR / "code_search.log"
+os.makedirs(_LOGS_DIR, exist_ok=True)
 
 _file_handler = RotatingFileHandler(
     _LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
