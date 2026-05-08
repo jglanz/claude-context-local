@@ -33,6 +33,7 @@ dependencies = [
     "fastmcp>=2.12.2",
     "huggingface-hub>=0.34.4",
     "mcp>=1.13.1",
+    "pathspec>=0.12",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.1.0",
     "pytest-cov>=6.2.1",
@@ -50,6 +51,7 @@ dependencies = [
     "tree-sitter-markdown>=0.3.2",
     "tree-sitter-python>=0.23.6",
     "tree-sitter-rust>=0.24.0",
+    "tree-sitter-solidity>=1.2.11",
     "tree-sitter-svelte>=1.0.2",
     "tree-sitter-typescript>=0.23.2",
 ]

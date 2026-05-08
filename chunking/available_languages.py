@@ -86,4 +86,10 @@ def get_availiable_language():
     except ImportError:
         logger.debug("tree-sitter-markdown not installed")
 
+    try:
+        import tree_sitter_solidity as tssolidity
+        res['solidity'] = Language(tssolidity.language())
+    except ImportError:
+        logger.debug("tree-sitter-solidity not installed")
+
     return res

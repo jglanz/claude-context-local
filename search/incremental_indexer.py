@@ -1,16 +1,21 @@
 """Incremental indexing using Merkle tree change detection."""
 
 import logging
+import multiprocessing
 import os
 import time
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from common_utils import project_context
 from merkle.change_detector import ChangeDetector, FileChanges
 from merkle.merkle_dag import MerkleDAG
 from merkle.snapshot_manager import SnapshotManager
 from chunking.multi_language_chunker import MultiLanguageChunker
+from chunking.parallel import chunk_one
 from embeddings.embedder import CodeEmbedder
 from search.indexer import CodeIndexManager as Indexer
 
@@ -41,8 +46,20 @@ def _env_float(name: str, default: float) -> float:
 
 # Default flush thresholds; env vars override at instantiation time.
 DEFAULT_FLUSH_FILES = 200
+DEFAULT_FLUSH_CHUNKS = 2000              # bound embedding-batch peak memory
 DEFAULT_FLUSH_BYTES = 256 * 1024 * 1024  # 256 MB of chunked content
 DEFAULT_FLUSH_SECONDS = 60.0
+
+# Checkpoint cadence: how often we rewrite the FAISS index file (expensive).
+# Per-flush metadata commits remain cheap and run on every flush.
+DEFAULT_CHECKPOINT_CHUNKS = 50_000
+DEFAULT_CHECKPOINT_SECONDS = 600.0       # 10 minutes
+
+# Chunking parallelism (one worker process per CPU, capped).
+DEFAULT_CHUNK_WORKERS = max(1, min(8, (os.cpu_count() or 2) - 1))
+
+# Periodic progress log cadence during a long-running indexing pass.
+DEFAULT_PROGRESS_SECONDS = 60.0
 
 
 @dataclass
@@ -82,8 +99,13 @@ class IncrementalIndexer:
         chunker: Optional[MultiLanguageChunker] = None,
         snapshot_manager: Optional[SnapshotManager] = None,
         flush_every_files: Optional[int] = None,
+        flush_every_chunks: Optional[int] = None,
         flush_every_bytes: Optional[int] = None,
         flush_every_seconds: Optional[float] = None,
+        checkpoint_every_chunks: Optional[int] = None,
+        checkpoint_every_seconds: Optional[float] = None,
+        n_chunk_workers: Optional[int] = None,
+        progress_every_seconds: Optional[float] = None,
     ):
         """Initialize incremental indexer.
 
@@ -92,11 +114,22 @@ class IncrementalIndexer:
             embedder: Embedder instance
             chunker: Code chunker instance
             snapshot_manager: Snapshot manager instance
-            flush_every_files: Flush index after this many files (env: CODE_SEARCH_FLUSH_FILES)
-            flush_every_bytes: Flush index after this many bytes of chunked content
-                (env: CODE_SEARCH_FLUSH_BYTES)
-            flush_every_seconds: Flush index after this many seconds since the last flush
-                (env: CODE_SEARCH_FLUSH_SECONDS)
+            flush_every_files: Flush after this many files (env CODE_SEARCH_FLUSH_FILES)
+            flush_every_chunks: Flush after the buffer has this many chunks
+                (env CODE_SEARCH_FLUSH_CHUNKS). Bounds peak embedding-batch memory.
+            flush_every_bytes: Flush after this many bytes of chunked content
+                (env CODE_SEARCH_FLUSH_BYTES)
+            flush_every_seconds: Flush after this many seconds since the last flush
+                (env CODE_SEARCH_FLUSH_SECONDS)
+            checkpoint_every_chunks: Rewrite FAISS index file after this many newly
+                indexed chunks (env CODE_SEARCH_CHECKPOINT_CHUNKS).
+            checkpoint_every_seconds: Rewrite FAISS index file after this many seconds
+                (env CODE_SEARCH_CHECKPOINT_SECONDS).
+            n_chunk_workers: Number of parallel chunker processes; 1 disables
+                parallelism (env CODE_SEARCH_CHUNK_WORKERS).
+            progress_every_seconds: Emit a progress log line at most this
+                often during indexing (env CODE_SEARCH_PROGRESS_SECONDS,
+                default 60). Set to 0 to disable.
         """
         self.indexer = indexer or Indexer()
         self.embedder = embedder or CodeEmbedder()
@@ -109,6 +142,11 @@ class IncrementalIndexer:
             if flush_every_files is not None
             else _env_int("CODE_SEARCH_FLUSH_FILES", DEFAULT_FLUSH_FILES)
         )
+        self.flush_every_chunks = (
+            flush_every_chunks
+            if flush_every_chunks is not None
+            else _env_int("CODE_SEARCH_FLUSH_CHUNKS", DEFAULT_FLUSH_CHUNKS)
+        )
         self.flush_every_bytes = (
             flush_every_bytes
             if flush_every_bytes is not None
@@ -119,11 +157,41 @@ class IncrementalIndexer:
             if flush_every_seconds is not None
             else _env_float("CODE_SEARCH_FLUSH_SECONDS", DEFAULT_FLUSH_SECONDS)
         )
+        self.checkpoint_every_chunks = (
+            checkpoint_every_chunks
+            if checkpoint_every_chunks is not None
+            else _env_int("CODE_SEARCH_CHECKPOINT_CHUNKS", DEFAULT_CHECKPOINT_CHUNKS)
+        )
+        self.checkpoint_every_seconds = (
+            checkpoint_every_seconds
+            if checkpoint_every_seconds is not None
+            else _env_float("CODE_SEARCH_CHECKPOINT_SECONDS", DEFAULT_CHECKPOINT_SECONDS)
+        )
+        self.n_chunk_workers = (
+            n_chunk_workers
+            if n_chunk_workers is not None
+            else _env_int("CODE_SEARCH_CHUNK_WORKERS", DEFAULT_CHUNK_WORKERS)
+        )
+        self.progress_every_seconds = (
+            progress_every_seconds
+            if progress_every_seconds is not None
+            else _env_float("CODE_SEARCH_PROGRESS_SECONDS", DEFAULT_PROGRESS_SECONDS)
+        )
+
+        # Checkpoint state — reset by _maybe_checkpoint after each rewrite.
+        self._chunks_since_checkpoint = 0
+        self._last_checkpoint_time = time.time()
+
         logger.info(
-            "Indexer flush thresholds: "
-            f"files={self.flush_every_files}, "
+            "Indexer thresholds: "
+            f"flush(files={self.flush_every_files}, "
+            f"chunks={self.flush_every_chunks}, "
             f"bytes={self.flush_every_bytes}, "
-            f"seconds={self.flush_every_seconds}"
+            f"seconds={self.flush_every_seconds}); "
+            f"checkpoint(chunks={self.checkpoint_every_chunks}, "
+            f"seconds={self.checkpoint_every_seconds}); "
+            f"chunk_workers={self.n_chunk_workers}; "
+            f"progress_every_seconds={self.progress_every_seconds}"
         )
     
     def detect_changes(self, project_path: str) -> Tuple[FileChanges, MerkleDAG]:
@@ -155,10 +223,23 @@ class IncrementalIndexer:
         """
         start_time = time.time()
         project_path = str(Path(project_path).resolve())
-        
+
         if not project_name:
             project_name = Path(project_path).name
-        
+
+        # Tag every log record produced under this call with the project name.
+        with project_context(project_name):
+            return self._incremental_index_inner(
+                project_path, project_name, force_full, start_time
+            )
+
+    def _incremental_index_inner(
+        self,
+        project_path: str,
+        project_name: str,
+        force_full: bool,
+        start_time: float,
+    ) -> IncrementalIndexResult:
         try:
             # Check if we should do full index
             if force_full or not self.snapshot_manager.has_snapshot(project_path):
@@ -189,8 +270,16 @@ class IncrementalIndexer:
             
             # Process changes
             chunks_removed = self._remove_old_chunks(changes, project_name)
+            if chunks_removed:
+                # Removals only touch SQLite; commit before adds so a crash
+                # mid-pass doesn't leave dangling FAISS rows referencing
+                # deleted metadata.
+                try:
+                    self.indexer.commit_metadata()
+                except Exception as e:
+                    logger.warning(f"Metadata commit after removals failed: {e}")
             chunks_added = self._add_new_chunks(changes, project_path, project_name)
-            
+
             # Update snapshot
             self.snapshot_manager.save_snapshot(current_dag, {
                 'project_name': project_name,
@@ -199,9 +288,10 @@ class IncrementalIndexer:
                 'files_removed': len(changes.removed),
                 'files_modified': len(changes.modified)
             })
-            
-            # Update index
-            self.indexer.save_index()
+
+            # Force a final checkpoint so the FAISS file on disk matches the
+            # snapshot we just persisted.
+            self._maybe_checkpoint(force=True)
             
             return IncrementalIndexResult(
                 files_added=len(changes.added),
@@ -258,7 +348,8 @@ class IncrementalIndexer:
                 supported_files, project_path, project_name
             )
 
-            # Save snapshot only after all batches succeeded
+            # Save snapshot only after all batches succeeded. The batched call
+            # already force-checkpoints on success, so no extra save is needed.
             self.snapshot_manager.save_snapshot(dag, {
                 'project_name': project_name,
                 'full_index': True,
@@ -266,9 +357,6 @@ class IncrementalIndexer:
                 'supported_files': len(supported_files),
                 'chunks_indexed': chunks_added
             })
-
-            # Final save (most recent batch was already flushed, but this is cheap)
-            self.indexer.save_index()
             
             return IncrementalIndexResult(
                 files_added=len(supported_files),
@@ -347,10 +435,18 @@ class IncrementalIndexer:
     ) -> int:
         """Chunk, embed, and persist files in batches with periodic flushing.
 
-        Buffers chunks in memory until any of the configured thresholds
-        (file count, byte count, elapsed time) is exceeded, then embeds and
-        writes the index to disk. On exception, flushes whatever is buffered
-        before re-raising so partial progress isn't lost.
+        Pipeline:
+          1. Chunking is dispatched to ``self.n_chunk_workers`` worker processes
+             via ``ProcessPoolExecutor`` (or runs in-process when workers <= 1).
+          2. Results stream back into the main thread; chunks accumulate in a
+             buffer until any flush threshold trips (files, chunks, bytes, time).
+          3. Each flush embeds the buffer and commits metadata cheaply.
+          4. The expensive FAISS index file is rewritten only on a checkpoint
+             cadence (``checkpoint_every_chunks`` / ``checkpoint_every_seconds``)
+             or when forced (final batch / error recovery).
+
+        On exception, flushes whatever is buffered and force-checkpoints before
+        re-raising, so partial progress is durable on disk.
 
         Returns:
             Total number of chunks embedded and added to the index.
@@ -362,6 +458,16 @@ class IncrementalIndexer:
         files_processed = 0
         last_flush_time = time.time()
         start = time.time()
+        total_files = len(supported_files)
+        last_progress_time = start
+
+        # Reset checkpoint clock at the start of each indexing pass.
+        self._chunks_since_checkpoint = 0
+        self._last_checkpoint_time = time.time()
+
+        logger.info(
+            f"Indexing pass starting: {total_files} supported files queued"
+        )
 
         def flush(reason: str) -> int:
             nonlocal chunks_buffer, bytes_buffer, files_in_batch, last_flush_time
@@ -383,49 +489,99 @@ class IncrementalIndexer:
             )
             return flushed
 
+        n_workers = max(1, int(self.n_chunk_workers))
+        tasks = [(project_path, f) for f in supported_files]
+
+        # Build the iterator. ProcessPoolExecutor.map streams results in order;
+        # chunksize trades off IPC overhead vs. straggler tolerance.
+        if n_workers <= 1 or not tasks:
+            executor_ctx = nullcontext()
+            iterator_factory = lambda: (chunk_one(t) for t in tasks)
+            executor = None
+        else:
+            # Force "spawn" so workers don't inherit a CUDA/torch-initialized
+            # parent (which deadlocks on fork). Spawn pays a one-time
+            # interpreter-startup cost per worker but is safe.
+            mp_ctx = multiprocessing.get_context("spawn")
+            executor = ProcessPoolExecutor(max_workers=n_workers, mp_context=mp_ctx)
+            executor_ctx = executor
+            iterator_factory = lambda: executor.map(chunk_one, tasks, chunksize=8)
+
         try:
-            for file_path in supported_files:
-                full_path = Path(project_path) / file_path
-                try:
-                    chunks = self.chunker.chunk_file(str(full_path))
-                except Exception as e:
-                    logger.warning(f"Failed to chunk {file_path}: {e}")
-                    chunks = []
+            with executor_ctx:
+                for chunks in iterator_factory():
+                    files_processed += 1
+                    files_in_batch += 1
+                    if chunks:
+                        chunks_buffer.extend(chunks)
+                        bytes_buffer += sum(
+                            len(c.content.encode("utf-8", errors="ignore"))
+                            for c in chunks
+                        )
 
-                files_processed += 1
-                files_in_batch += 1
-                if chunks:
-                    chunks_buffer.extend(chunks)
-                    bytes_buffer += sum(
-                        len(c.content.encode("utf-8", errors="ignore")) for c in chunks
-                    )
+                    if files_in_batch >= self.flush_every_files:
+                        total_chunks += flush("file count")
+                    elif len(chunks_buffer) >= self.flush_every_chunks:
+                        total_chunks += flush("chunk count")
+                    elif bytes_buffer >= self.flush_every_bytes:
+                        total_chunks += flush("byte count")
+                    elif (time.time() - last_flush_time) >= self.flush_every_seconds:
+                        total_chunks += flush("elapsed time")
 
-                if files_in_batch >= self.flush_every_files:
-                    total_chunks += flush("file count")
-                elif bytes_buffer >= self.flush_every_bytes:
-                    total_chunks += flush("byte count")
-                elif (time.time() - last_flush_time) >= self.flush_every_seconds:
-                    total_chunks += flush("elapsed time")
+                    # Periodic progress line (independent of flush cadence).
+                    if (
+                        self.progress_every_seconds > 0
+                        and (time.time() - last_progress_time)
+                            >= self.progress_every_seconds
+                    ):
+                        elapsed = time.time() - start
+                        pct = (files_processed / total_files * 100.0) if total_files else 100.0
+                        rate = files_processed / elapsed if elapsed > 0 else 0.0
+                        remaining = max(0, total_files - files_processed)
+                        eta_s = (remaining / rate) if rate > 0 else float("inf")
+                        eta_str = (
+                            f"{eta_s/60:.1f}m" if eta_s != float("inf") else "?"
+                        )
+                        logger.info(
+                            f"Progress: {files_processed}/{total_files} files "
+                            f"({pct:.1f}%) | indexed {total_chunks} chunks | "
+                            f"buffered {len(chunks_buffer)} | "
+                            f"{rate:.1f} files/s | elapsed {elapsed/60:.1f}m | "
+                            f"ETA {eta_str}"
+                        )
+                        last_progress_time = time.time()
 
-            total_chunks += flush("final")
+                total_chunks += flush("final")
+
+            # Always force a checkpoint after a successful pass so the FAISS
+            # file on disk reflects all flushed work.
+            self._maybe_checkpoint(force=True)
+
             logger.info(
                 f"Indexing complete: {total_chunks} chunks from "
-                f"{files_processed} files in {time.time() - start:.1f}s"
+                f"{files_processed} files in {time.time() - start:.1f}s "
+                f"(workers={n_workers})"
             )
             return total_chunks
         except Exception:
             try:
                 total_chunks += flush("error recovery")
+                self._maybe_checkpoint(force=True)
                 logger.error(
                     f"Indexing aborted after {files_processed} files; "
                     f"flushed {total_chunks} chunks before failure"
                 )
             except Exception as inner:
                 logger.error(f"Failed to flush during error recovery: {inner}")
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
             raise
 
     def _embed_and_persist_batch(self, chunks: list, project_name: str) -> int:
-        """Embed a buffered batch of chunks, add to index, and persist to disk."""
+        """Embed a buffered batch of chunks, add to index, commit metadata.
+
+        FAISS index file rewrite is deferred to ``_maybe_checkpoint``.
+        """
         if not chunks:
             return 0
         try:
@@ -439,11 +595,42 @@ class IncrementalIndexer:
         if embedding_results:
             self.indexer.add_embeddings(embedding_results)
             try:
-                self.indexer.save_index()
+                self.indexer.commit_metadata()
             except Exception as e:
-                logger.error(f"Failed to persist index after batch: {e}")
+                logger.error(f"Failed to commit metadata after batch: {e}")
                 raise
+            self._chunks_since_checkpoint += len(embedding_results)
+            self._maybe_checkpoint()
         return len(embedding_results)
+
+    def _maybe_checkpoint(self, force: bool = False) -> None:
+        """Rewrite the FAISS index file when the cadence triggers (or forced).
+
+        Honors ``checkpoint_every_chunks`` and ``checkpoint_every_seconds``.
+        Resets counters after a successful checkpoint.
+        """
+        new_chunks = self._chunks_since_checkpoint
+        elapsed = time.time() - self._last_checkpoint_time
+        if not (
+            force
+            or new_chunks >= self.checkpoint_every_chunks
+            or elapsed >= self.checkpoint_every_seconds
+        ):
+            return
+        if new_chunks == 0 and not force:
+            return
+        t0 = time.time()
+        try:
+            self.indexer.checkpoint()
+        except Exception as e:
+            logger.error(f"FAISS checkpoint failed: {e}")
+            raise
+        logger.info(
+            f"Checkpointed FAISS index ({new_chunks} new chunks, "
+            f"{elapsed:.0f}s since last) in {time.time() - t0:.1f}s"
+        )
+        self._chunks_since_checkpoint = 0
+        self._last_checkpoint_time = time.time()
     
     
     def get_indexing_stats(self, project_path: str) -> Optional[Dict]:

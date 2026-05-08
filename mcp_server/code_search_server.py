@@ -13,7 +13,7 @@ from functools import lru_cache
 # Add the parent directory to the path so we can import our modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from common_utils import get_storage_dir
+from common_utils import get_storage_dir, project_context
 from chunking.multi_language_chunker import MultiLanguageChunker
 from embeddings.embedder import CodeEmbedder
 from search.indexer import CodeIndexManager
@@ -32,6 +32,21 @@ class CodeSearchServer:
         self._index_manager: Optional[CodeIndexManager] = None
         self._searcher: Optional[IntelligentSearcher] = None
         self._current_project: Optional[str] = None
+
+    def _resolve_project_name(self, project_path: Optional[str] = None) -> str:
+        """Best-effort project name for log tagging.
+
+        Resolution order:
+          1. Explicit ``project_path`` argument.
+          2. ``self._current_project`` if a previous call set it.
+          3. Current working directory (the same fallback used by
+             ``get_index_manager`` when no project has been selected yet).
+        """
+        target = project_path or self._current_project or os.getcwd()
+        try:
+            return Path(target).resolve().name or "-"
+        except Exception:
+            return "-"
 
     def get_project_storage_dir(self, project_path: str) -> Path:
         """Get or create project-specific storage directory."""
@@ -164,6 +179,23 @@ class CodeSearchServer:
         max_age_minutes: float = 5
     ) -> str:
         """Implementation of search_code tool."""
+        with project_context(self._resolve_project_name()):
+            return self._search_code_impl(
+                query, k, search_mode, file_pattern, chunk_type,
+                include_context, auto_reindex, max_age_minutes
+            )
+
+    def _search_code_impl(
+        self,
+        query: str,
+        k: int,
+        search_mode: str,
+        file_pattern: Optional[str],
+        chunk_type: Optional[str],
+        include_context: bool,
+        auto_reindex: bool,
+        max_age_minutes: float,
+    ) -> str:
         try:
             logger.info(f"🔍 MCP REQUEST: search_code(query='{query}', k={k}, mode='{search_mode}', file_pattern={file_pattern}, chunk_type={chunk_type})")
 
@@ -261,6 +293,19 @@ class CodeSearchServer:
         incremental: bool = True
     ) -> str:
         """Implementation of index_directory tool."""
+        scope_name = project_name or self._resolve_project_name(directory_path)
+        with project_context(scope_name):
+            return self._index_directory_impl(
+                directory_path, project_name, file_patterns, incremental
+            )
+
+    def _index_directory_impl(
+        self,
+        directory_path: str,
+        project_name: Optional[str],
+        file_patterns: Optional[List[str]],
+        incremental: bool,
+    ) -> str:
         try:
             from search.incremental_indexer import IncrementalIndexer
 
@@ -320,6 +365,10 @@ class CodeSearchServer:
 
     def find_similar_code(self, chunk_id: str, k: int = 5) -> str:
         """Implementation of find_similar_code tool."""
+        with project_context(self._resolve_project_name()):
+            return self._find_similar_code_impl(chunk_id, k)
+
+    def _find_similar_code_impl(self, chunk_id: str, k: int) -> str:
         try:
             searcher = self.get_searcher()
             results = searcher.find_similar_to_chunk(chunk_id, k=k)
@@ -349,6 +398,10 @@ class CodeSearchServer:
 
     def get_index_status(self) -> str:
         """Implementation of get_index_status tool."""
+        with project_context(self._resolve_project_name()):
+            return self._get_index_status_impl()
+
+    def _get_index_status_impl(self) -> str:
         try:
             index_manager = self.get_index_manager()
             stats = index_manager.get_stats()
@@ -407,6 +460,10 @@ class CodeSearchServer:
 
     def switch_project(self, project_path: str) -> str:
         """Implementation of switch_project tool."""
+        with project_context(self._resolve_project_name(project_path)):
+            return self._switch_project_impl(project_path)
+
+    def _switch_project_impl(self, project_path: str) -> str:
         try:
             project_path = Path(project_path).resolve()
             if not project_path.exists():

@@ -87,6 +87,23 @@ class LanguageChunker(ABC):
         """
         return node.type in self.splittable_node_types
 
+    def _get_recursable_container_types(self) -> Set[str]:
+        """Container node types whose children should still be visited after
+        the container itself is chunked, so nested members get their own
+        chunks.
+
+        Default: classes (so methods are extracted). Languages with other
+        type-bearing containers (e.g. Solidity contracts/libraries) override.
+        """
+        return {'class_definition', 'class_declaration'}
+
+    def _container_parent_info(self, node: Any, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Parent info dict propagated to children of a recursable container."""
+        return {
+            'parent_name': metadata.get('name'),
+            'parent_type': metadata.get('node_type', node.type),
+        }
+
     def get_node_text(self, node: Any, source: bytes) -> str:
         """Get text content of a node.
 
@@ -145,16 +162,13 @@ class LanguageChunker(ABC):
                 )
                 chunks.append(chunk)
 
-                # For classes, continue traversing to find methods
-                # For other chunked nodes, stop traversal
-                if node.type in ['class_definition', 'class_declaration']:
-                    # Pass class info to children
-                    class_info = {
-                        'parent_name': metadata.get('name'),
-                        'parent_type': 'class'
-                    }
+                # For containers (classes by default; contracts/libraries
+                # for languages that opt in via _get_recursable_container_types),
+                # continue traversing so nested members are chunked too.
+                if node.type in self._get_recursable_container_types():
+                    container_info = self._container_parent_info(node, metadata)
                     for child in node.children:
-                        traverse(child, depth + 1, class_info)
+                        traverse(child, depth + 1, container_info)
                 return
 
             # Traverse children, passing along parent info

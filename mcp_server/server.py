@@ -9,23 +9,34 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import logging
 from logging.handlers import RotatingFileHandler
 
-_LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+from common_utils import ProjectLogFilter
+
+# `%(project)s` is injected onto every LogRecord by ProjectLogFilter so any
+# module's logger output gets attributed to the project being indexed.
+_LOG_FORMAT = '%(asctime)s - [%(project)s] %(name)s - %(levelname)s - %(message)s'
 _PROJECT_ROOT = Path(__file__).parent.parent
 _LOGS_DIR = _PROJECT_ROOT / "logs"
 _LOG_FILE = _LOGS_DIR / "code_search.log"
 os.makedirs(_LOGS_DIR, exist_ok=True)
+
+_project_filter = ProjectLogFilter()
 
 _file_handler = RotatingFileHandler(
     _LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
 )
 _file_handler.setLevel(logging.DEBUG)
 _file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+_file_handler.addFilter(_project_filter)
 
 _stream_handler = logging.StreamHandler()
 _stream_handler.setLevel(logging.DEBUG)
 _stream_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+_stream_handler.addFilter(_project_filter)
 
 logging.basicConfig(level=logging.DEBUG, handlers=[_stream_handler, _file_handler])
+# Also attach the filter to the root logger so any handler installed later
+# (or attached to specific loggers) still sees `record.project` populated.
+logging.getLogger().addFilter(_project_filter)
 logger = logging.getLogger(__name__)
 logging.getLogger("mcp").setLevel(logging.DEBUG)
 logging.getLogger("fastmcp").setLevel(logging.DEBUG)

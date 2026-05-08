@@ -2,10 +2,33 @@
 
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
+import pathspec
+
+logger = logging.getLogger(__name__)
+
+IGNORE_FILE_NAME = ".claude-context-ignore"
+DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MB; override via CODE_SEARCH_MAX_FILE_BYTES
+
+
+def load_pathspec(root: Path) -> Optional[pathspec.PathSpec]:
+    """Load a gitignore-syntax PathSpec from `<root>/.claude-context-ignore` if present."""
+    p = root / IGNORE_FILE_NAME
+    try:
+        if not p.is_file():
+            return None
+        with p.open("r", encoding="utf-8") as f:
+            spec = pathspec.PathSpec.from_lines("gitwildmatch", f)
+        logger.info(f"Loaded ignore patterns from {p}")
+        return spec
+    except OSError as e:
+        logger.warning(f"Failed to read {p}: {e}")
+        return None
 
 
 @dataclass
@@ -44,17 +67,30 @@ class MerkleNode:
 class MerkleDAG:
     """Merkle DAG for tracking file system changes."""
     
-    def __init__(self, root_path: str):
+    def __init__(self, root_path: str, max_file_bytes: Optional[int] = None):
         """Initialize Merkle DAG for a directory tree.
-        
+
         Args:
             root_path: Root directory to track
+            max_file_bytes: Skip files larger than this. None resolves from
+                env CODE_SEARCH_MAX_FILE_BYTES (default 2 MB).
         """
         self.root_path = Path(root_path).resolve()
         self.nodes: Dict[str, MerkleNode] = {}
         self.root_node: Optional[MerkleNode] = None
+        if max_file_bytes is None:
+            try:
+                max_file_bytes = int(
+                    os.environ.get("CODE_SEARCH_MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES)
+                )
+            except ValueError:
+                max_file_bytes = DEFAULT_MAX_FILE_BYTES
+        self.max_file_bytes = max_file_bytes
+        self.pathspec: Optional[pathspec.PathSpec] = load_pathspec(self.root_path)
         self.ignore_patterns: Set[str] = {
             '__pycache__', '.git', '.hg', '.svn',
+            'compile_commands.json',
+            'vcpkg',
             '.venv', 'venv', 'env', '.env', '.direnv',
             'node_modules', '.pnpm-store', '.yarn',
             '.pytest_cache', '.mypy_cache', '.ruff_cache', '.pytype', '.ipynb_checkpoints',
@@ -69,15 +105,18 @@ class MerkleDAG:
     
     def should_ignore(self, path: Path) -> bool:
         """Check if a path should be ignored.
-        
+
+        Built-in name patterns are checked first (cheap), then any
+        gitignore-syntax rules from `.claude-context-ignore` (root-relative).
+
         Args:
             path: Path to check
-            
+
         Returns:
             True if path should be ignored
         """
         name = path.name
-         
+
         # Check exact matches and patterns
         for pattern in self.ignore_patterns:
             if pattern.startswith('*'):
@@ -85,7 +124,24 @@ class MerkleDAG:
                     return True
             elif name == pattern:
                 return True
-        
+
+        # Project-level ignore file (gitignore syntax).
+        if self.pathspec is not None and path != self.root_path:
+            try:
+                rel = path.relative_to(self.root_path).as_posix()
+            except ValueError:
+                # Symlink target outside root, etc. Defer to built-ins only.
+                return False
+            # gitignore semantics: directories match with trailing "/"
+            try:
+                is_dir = path.is_dir()
+            except OSError:
+                is_dir = False
+            if is_dir:
+                rel = rel + "/"
+            if self.pathspec.match_file(rel):
+                return True
+
         return False
     
     def hash_file(self, file_path: Path) -> Tuple[str, int]:
@@ -155,6 +211,16 @@ class MerkleDAG:
             relative_path = str(path.relative_to(self.root_path))
         
         if path.is_file():
+            try:
+                stat_size = path.stat().st_size
+            except OSError:
+                return None
+            if self.max_file_bytes and stat_size > self.max_file_bytes:
+                logger.debug(
+                    f"Skipping oversized file ({stat_size} B > "
+                    f"{self.max_file_bytes} B): {relative_path}"
+                )
+                return None
             file_hash, size = self.hash_file(path)
             node = MerkleNode(
                 path=relative_path,

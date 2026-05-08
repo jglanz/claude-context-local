@@ -61,6 +61,22 @@ class TreeSitterChunker:
             return []
 
         if content is None:
+            # Cheap pre-check: bail on binary or non-utf8 sources before doing
+            # the full read + tree-sitter parse. Costs ~4 KB of I/O per file.
+            try:
+                with open(file_path, 'rb') as fb:
+                    head = fb.read(4096)
+            except OSError as e:
+                logger.error(f"Failed to read file {file_path}: {e}")
+                return []
+            if b"\x00" in head:
+                logger.debug(f"Skipping binary file: {file_path}")
+                return []
+            try:
+                head.decode("utf-8")
+            except UnicodeDecodeError:
+                logger.debug(f"Skipping non-utf8 file: {file_path}")
+                return []
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()

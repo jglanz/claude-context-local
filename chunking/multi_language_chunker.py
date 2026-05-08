@@ -7,6 +7,7 @@ from typing import List, Optional
 from chunking.code_chunk import CodeChunk
 from chunking.tree_sitter import TreeSitterChunker, TreeSitterChunk
 from chunking.languages import LANGUAGE_MAP
+from merkle.merkle_dag import load_pathspec
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ class MultiLanguageChunker:
     
     def __init__(self, root_path: Optional[str] = None):
         """Initialize multi-language chunker.
-        
+
         Args:
             root_path: Optional root path for relative path calculation
         """
@@ -40,6 +41,10 @@ class MultiLanguageChunker:
         # Use AST chunker for Python (more mature implementation)
         # Use tree-sitter for other languages
         self.tree_sitter_chunker = TreeSitterChunker()
+        # Project-level ignore (.claude-context-ignore) for chunk_directory()
+        self.pathspec = (
+            load_pathspec(Path(root_path)) if root_path else None
+        )
     
     def is_supported(self, file_path: str) -> bool:
         """Check if file type is supported.
@@ -133,6 +138,13 @@ class MultiLanguageChunker:
                 'section': 'section',  # Markdown
                 'preamble': 'preamble',  # Markdown
                 'document': 'document',  # Markdown
+                'contract_declaration': 'contract',  # Solidity
+                'library_declaration': 'library',  # Solidity
+                'modifier_definition': 'modifier',  # Solidity
+                'constructor_definition': 'constructor',  # Solidity
+                'fallback_receive_definition': 'function',  # Solidity (fallback/receive)
+                'event_definition': 'event',  # Solidity
+                'error_declaration': 'error',  # Solidity
             }
             
             chunk_type = chunk_type_map.get(tchunk.node_type, tchunk.node_type)
@@ -223,7 +235,16 @@ class MultiLanguageChunker:
                 # Skip common large/build/tooling directories
                 if any(part in self.DEFAULT_IGNORED_DIRS for part in file_path.parts):
                     continue
-                
+
+                # Honor project .claude-context-ignore (gitignore syntax)
+                if self.pathspec is not None and self.root_path:
+                    try:
+                        rel = file_path.relative_to(self.root_path).as_posix()
+                    except ValueError:
+                        rel = None
+                    if rel and self.pathspec.match_file(rel):
+                        continue
+
                 try:
                     chunks = self.chunk_file(str(file_path))
                     all_chunks.extend(chunks)

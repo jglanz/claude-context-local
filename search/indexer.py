@@ -125,16 +125,14 @@ class CodeIndexManager:
             }
         
         self._logger.info(f"Added {len(embedding_results)} embeddings to index")
-        
-        # Commit metadata in a single transaction for performance
+
+        # Commit metadata in a single transaction for performance.
+        # Stats recomputation is expensive (O(N) over all chunks) so it is
+        # deferred to ``checkpoint`` instead of running per batch.
         try:
             self.metadata_db.commit()
         except Exception:
-            # If commit is unavailable for some reason, continue without failing
             pass
-        
-        # Update statistics
-        self._update_stats()
 
     def _gpu_is_available(self) -> bool:
         """Check if GPU FAISS support is available and GPUs are present."""
@@ -316,30 +314,68 @@ class CodeIndexManager:
             pass
         return len(chunks_to_remove)
     
-    def save_index(self):
-        """Save the FAISS index and chunk IDs to disk."""
-        if self._index is not None:
+    def commit_metadata(self):
+        """Cheap, per-flush durability: SQLite WAL commit + chunk-id pickle.
+
+        Writes O(MB), not O(GB). Safe to call after every batch. The FAISS
+        index file itself is NOT rewritten here — see ``checkpoint``.
+        """
+        if self._metadata_db is not None:
             try:
-                index_to_write = self._index
-                # If on GPU, convert to CPU before saving
-                if self._on_gpu and hasattr(faiss, 'index_gpu_to_cpu'):
-                    index_to_write = faiss.index_gpu_to_cpu(self._index)
-                faiss.write_index(index_to_write, str(self.index_path))
-                self._logger.info(f"Saved index to {self.index_path}")
+                self._metadata_db.commit()
             except Exception as e:
-                self._logger.warning(f"Failed to save GPU index directly, attempting CPU fallback: {e}")
-                try:
-                    cpu_index = faiss.index_gpu_to_cpu(self._index)
-                    faiss.write_index(cpu_index, str(self.index_path))
-                    self._logger.info(f"Saved index to {self.index_path} (CPU fallback)")
-                except Exception as e2:
-                    self._logger.error(f"Failed to save FAISS index: {e2}")
-        
-        # Save chunk IDs
-        with open(self.chunk_id_path, 'wb') as f:
-            pickle.dump(self._chunk_ids, f)
-        
+                self._logger.warning(f"Metadata commit failed: {e}")
+        # Atomic-ish chunk-id pickle (write tmp then replace) so a crash mid-
+        # write doesn't truncate the previous good copy.
+        tmp_path = self.chunk_id_path.with_suffix(self.chunk_id_path.suffix + ".tmp")
+        try:
+            with open(tmp_path, 'wb') as f:
+                pickle.dump(self._chunk_ids, f)
+            os.replace(tmp_path, self.chunk_id_path)
+        except Exception as e:
+            self._logger.error(f"Failed to write chunk_ids: {e}")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
+    def checkpoint(self):
+        """Expensive durability: rewrite FAISS index file + stats.json.
+
+        Idempotent and skippable. For a 1M-chunk 768-dim index this writes
+        ~3 GB and recomputes stats by iterating every chunk. Call sparingly
+        (see IncrementalIndexer's checkpoint cadence).
+        """
+        # Always commit metadata + chunk_ids first so the FAISS file is
+        # consistent with on-disk metadata.
+        self.commit_metadata()
+
+        if self._index is None:
+            return
+
+        try:
+            index_to_write = self._index
+            if self._on_gpu and hasattr(faiss, 'index_gpu_to_cpu'):
+                index_to_write = faiss.index_gpu_to_cpu(self._index)
+            faiss.write_index(index_to_write, str(self.index_path))
+            self._logger.info(f"Saved index to {self.index_path}")
+        except Exception as e:
+            self._logger.warning(
+                f"Failed to save GPU index directly, attempting CPU fallback: {e}"
+            )
+            try:
+                cpu_index = faiss.index_gpu_to_cpu(self._index)
+                faiss.write_index(cpu_index, str(self.index_path))
+                self._logger.info(f"Saved index to {self.index_path} (CPU fallback)")
+            except Exception as e2:
+                self._logger.error(f"Failed to save FAISS index: {e2}")
+
         self._update_stats()
+
+    def save_index(self):
+        """Back-compat alias: full checkpoint (FAISS + stats + metadata)."""
+        self.checkpoint()
     
     def _update_stats(self):
         """Update index statistics."""

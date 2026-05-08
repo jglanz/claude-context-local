@@ -198,6 +198,50 @@ The system uses advanced parsing to create semantically meaningful chunks across
 
 - `CODE_SEARCH_STORAGE`: Custom storage directory (default: `~/.claude_code_search`)
 
+#### Indexing tunables (large-codebase support)
+
+| Variable                          | Default              | Purpose                                                                 |
+| --------------------------------- | -------------------- | ----------------------------------------------------------------------- |
+| `CODE_SEARCH_MAX_FILE_BYTES`      | `2097152` (2 MB)     | Skip files larger than this before hashing/chunking                     |
+| `CODE_SEARCH_FLUSH_FILES`         | `200`                | Embed and flush after this many files                                   |
+| `CODE_SEARCH_FLUSH_CHUNKS`        | `2000`               | Embed and flush after the buffer holds this many chunks                 |
+| `CODE_SEARCH_FLUSH_BYTES`         | `268435456` (256 MB) | Embed and flush after this many bytes of chunked content                |
+| `CODE_SEARCH_FLUSH_SECONDS`       | `60`                 | Embed and flush after this many seconds of chunking                     |
+| `CODE_SEARCH_CHECKPOINT_CHUNKS`   | `50000`              | Rewrite the FAISS index file after this many newly indexed chunks       |
+| `CODE_SEARCH_CHECKPOINT_SECONDS`  | `600`                | Rewrite the FAISS index file after this many seconds                    |
+| `CODE_SEARCH_CHUNK_WORKERS`       | `min(8, cpu-1)`      | Parallel chunker processes; `1` disables parallelism                    |
+
+Per-flush durability (SQLite metadata + chunk-id pickle) is always synchronous;
+the expensive FAISS index rewrite is deferred to checkpoint cadence so a
+mid-run crash still leaves a queryable on-disk index from the last checkpoint.
+
+#### Per-project ignore file: `.claude-context-ignore`
+
+Drop a `.claude-context-ignore` file at the project root with gitignore syntax
+(supports `**`, negation `!`, anchored `/foo`). It runs **in addition to** the
+built-in directory blocklist (`node_modules`, `.git`, `vcpkg`, etc.) — built-ins
+always apply.
+
+To reuse an existing `.gitignore`:
+
+```bash
+ln -s .gitignore .claude-context-ignore
+```
+
+Example for a vendored C/C++ tree (gitignore semantics: a directory pattern
+without a leading slash matches at any depth):
+
+```
+vcpkg/
+build/
+buildtrees/
+downloads/
+installed/
+```
+
+(Avoid blanket-ignoring `packages/` — many monorepos use it as the workspace
+root. Add it explicitly only if you know your tree treats it as build output.)
+
 ### Model Configuration
 
 The system uses `google/embeddinggemma-300m` by default.
@@ -239,7 +283,7 @@ and prefer offline loads for speed and reliability.
 
 ### Supported Languages & Extensions
 
-**Fully Supported (15 extensions across 9+ languages):**
+**Fully Supported (16 extensions across 10+ languages):**
 
 | Language       | Extensions                    |
 | -------------- | ----------------------------- |
@@ -252,9 +296,10 @@ and prefer offline loads for speed and reliability.
 | **C**          | `.c`                          |
 | **C++**        | `.cpp`, `.cc`, `.cxx`, `.c++` |
 | **C#**         | `.cs`                         |
+| **Solidity**   | `.sol`                        |
 | **Svelte**     | `.svelte`                     |
 
-**Total**: **15 file extensions** across **9+ programming languages**
+**Total**: **16 file extensions** across **10+ programming languages**
 
 ## Storage
 
